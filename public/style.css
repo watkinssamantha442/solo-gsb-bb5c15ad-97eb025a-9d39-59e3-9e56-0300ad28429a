@@ -86,6 +86,22 @@ body {
 }
 .mode-switch input { width: auto; }
 
+.isolate-row {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 0 0 10px;
+  font-size: 12.5px;
+}
+.isolate-row label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+}
+.isolate-row input { width: auto; }
+.isolate-row .hint { margin: 6px 0 0; color: var(--muted); line-height: 1.55; }
+
 .batch-opts {
   border: 1px dashed var(--line);
   border-radius: 8px;
@@ -277,7 +293,7 @@ input:focus, select:focus {
 }
 .products-head {
   display: grid;
-  grid-template-columns: 1.4fr 0.75fr 0.75fr 0.65fr 0.95fr 34px;
+  grid-template-columns: 1.2fr 1fr 0.7fr 0.7fr 0.6fr 0.9fr 34px;
   gap: 8px;
   font-size: 12px;
   color: var(--muted);
@@ -285,7 +301,7 @@ input:focus, select:focus {
 }
 .products-row {
   display: grid;
-  grid-template-columns: 1.4fr 0.75fr 0.75fr 0.65fr 0.95fr 34px;
+  grid-template-columns: 1.2fr 1fr 0.7fr 0.7fr 0.6fr 0.9fr 34px;
   gap: 8px;
   margin-bottom: 8px;
   align-items: center;
@@ -398,6 +414,30 @@ input:focus, select:focus {
 .unplaced th { background: #fff0f0; }
 .badge-ok { color: #2f9e44; font-weight: 600; }
 .badge-bad { color: var(--danger); font-weight: 600; }
+
+/* 订单隔离排产汇总 */
+.order-summary { margin-bottom: 12px; }
+.order-summary h3 { font-size: 14px; margin: 0 0 8px; color: #102a56; }
+.order-summary table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.order-summary th, .order-summary td {
+  border: 1px solid #c3d0f7;
+  padding: 5px 8px;
+  text-align: left;
+}
+.order-summary th { background: #e7eefe; }
+.order-summary td.num, .order-summary th.num { text-align: right; }
+.order-summary tr.order-done td { color: #2f9e44; }
+.order-summary tr.order-open td { font-weight: 600; }
+.order-summary .blocked-table { margin-bottom: 10px; }
+.order-summary .blocked-table th { background: #fff0f0; border-color: #f0caca; }
+.order-summary .blocked-table td { border-color: #f0caca; font-weight: 400; }
+.order-summary code {
+  background: #fff3bf;
+  border: 1px solid #ffd43b;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 12px;
+}
 
 .foot {
   text-align: center;

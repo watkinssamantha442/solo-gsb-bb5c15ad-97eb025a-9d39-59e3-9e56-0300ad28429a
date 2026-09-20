@@ -43,6 +43,23 @@ function normalizeProductGrain(value, pos) {
 }
 
 /**
+ * 规范化订单号：缺省（null/undefined/空白）为 ''，表示该行不属于任何订单；
+ * 订单隔离排产开启后，无订单号的成品归入“无订单”组（组内仍可混排）。
+ * 仅允许字符串/数字（布尔等类型拒绝），最大长度 64。
+ */
+function normalizeOrderNo(value, pos) {
+  if (value == null) return '';
+  if (typeof value === 'boolean') {
+    throw new Error(`第 ${pos} 种成品的订单号无效`);
+  }
+  const s = String(value).trim();
+  if (s.length > 64) {
+    throw new Error(`第 ${pos} 种成品的订单号不能超过 64 个字符`);
+  }
+  return s;
+}
+
+/**
  * 纹向是否允许某放置朝向（两者纹向平行才可采用）：
  *  - 不限（any）：两种朝向均可；
  *  - 未旋转：成品宽 ∥ 纸张宽，要求须与纸张纹向一致；
@@ -231,13 +248,14 @@ function layout(input) {
       throw new Error(`第 ${idx + 1} 种成品的数量无效`);
     }
     const grain = normalizeProductGrain(p.grain, idx + 1);
+    const orderNo = normalizeOrderNo(p.orderNo, idx + 1);
     const id = p.id != null ? String(p.id) : `P${idx + 1}`;
     const name = p.name && String(p.name).trim() ? String(p.name).trim() : '';
     for (let n = 1; n <= q; n++) {
-      pieces.push({ id, name, w, h, grain, pieceNo: n });
+      pieces.push({ id, name, w, h, grain, orderNo, pieceNo: n });
     }
     totalPieces += q;
-    if (q > 0) unplaced.push({ id, name, width: w, height: h, grain, quantity: q });
+    if (q > 0) unplaced.push({ id, name, width: w, height: h, grain, orderNo, quantity: q });
   });
 
   // 大件优先：最长边降序，再按面积、最短边
@@ -349,6 +367,7 @@ function layout(input) {
         h: round3(node.h),
         id: p.id,
         name: p.name,
+        orderNo: p.orderNo || '',
         specW: p.w,
         specH: p.h,
         rotated: !!p.rotated,
@@ -404,6 +423,7 @@ function layout(input) {
     .map((u) => ({
       id: u.id,
       name: u.name,
+      orderNo: u.orderNo || '',
       width: u.width,
       height: u.height,
       grain: u.grain,
@@ -442,6 +462,15 @@ function layout(input) {
 }
 
 /**
+ * 校验排产开关 isolateOrders：仅接受布尔值或缺省（缺省 false，保持旧行为）
+ */
+function normalizeIsolateOrders(value) {
+  if (value === true) return true;
+  if (value === false || value == null) return false;
+  throw new Error('「每张纸仅排一个订单」开关必须是布尔值（true/false）');
+}
+
+/**
  * 批量排产：按与 layout() 完全相同的断头台规则（含纹向约束）逐张排样。
  * 每张纸排完后，从剩余需求中扣除该张已排数量（直接以该张的
  * unplaced 作为下一张的需求清单，纹向要求随件保留），直到满足任一终止条件：
@@ -451,12 +480,12 @@ function layout(input) {
  *    （尺寸或纹向限制均可能导致；该空白纸不计入结果并立即停止，
  *      绝不输出空白纸；循环上界为 maxSheets 且每张至少排入一件，必然终止）
  *
- * @param {object} input  同 layout()，另需 maxSheets：正整数（≤500）
- * @returns {{
- *   paper: object, stopReason: string,
- *   summary: { maxSheets, sheetsUsed, piecesPlaced, piecesTotal, completionRate, cutsTotal },
- *   sheets: Array,   // 每张纸各自完整的 layout() 结果
- *   remaining: Array // 仍未排入的成品（结构同 layout() 的 unplaced）
+ * isolateOrders 为 true 时启用订单隔离（详见 layoutBatchIsolated）。
+ *
+ * @param {object} input  同 layout()，另需 maxSheets：正整数（≤500），
+ *   可选 isolateOrders：boolean（缺省 false）
+ * @returns 非隔离时同下；隔离时 sheets 为 [{ round, orderNo, piecesPlaced,
+ *   placedArea, selection:{ranked}, layout }]，并含 orders、blockedOrders
  * }}
  */
 function layoutBatch(input) {
@@ -465,7 +494,27 @@ function layoutBatch(input) {
     throw new Error('最多用纸张数必须是正整数');
   }
   if (maxSheets > 500) throw new Error('最多用纸张数不能超过 500');
+  const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
+  if (isolateOrders) {
+    return layoutBatchIsolated(input, maxSheets);
+  }
+  return layoutBatchMixed(input, maxSheets);
+}
 
+function demandRowFromUnplaced(u) {
+  return {
+    id: u.id,
+    name: u.name,
+    orderNo: u.orderNo || '',
+    width: u.width,
+    height: u.height,
+    grain: u.grain,
+    quantity: u.quantity,
+  };
+}
+
+/** 未开启订单隔离的批量排产（历史行为：一张纸可混排所有订单/无订单成品） */
+function layoutBatchMixed(input, maxSheets) {
   // 首轮直接透传原始清单，纸张/成品/纹向校验由 layout 完成
   let demand = input.products;
   const originalTotal = new Map(); // id → 原始需求件数
@@ -514,15 +563,8 @@ function layoutBatch(input) {
       break;
     }
 
-    // 扣除本张已排数量，剩余需求（含纹向要求）进入下一张纸
-    demand = result.unplaced.map((u) => ({
-      id: u.id,
-      name: u.name,
-      width: u.width,
-      height: u.height,
-      grain: u.grain,
-      quantity: u.quantity,
-    }));
+    // 扣除本张已排数量，剩余需求（含纹向、订单号）进入下一张纸
+    demand = result.unplaced.map(demandRowFromUnplaced);
   }
 
   const remaining = lastUnplaced.map((u) => {
@@ -530,6 +572,7 @@ function layoutBatch(input) {
     return {
       id: u.id,
       name: u.name,
+      orderNo: u.orderNo || '',
       width: u.width,
       height: u.height,
       grain: u.grain,
@@ -544,6 +587,7 @@ function layoutBatch(input) {
 
   return {
     paper,
+    isolateOrders: false,
     stopReason,
     summary: {
       maxSheets,
@@ -558,10 +602,273 @@ function layoutBatch(input) {
   };
 }
 
+/**
+ * 订单隔离批量排产：每张纸仅排一个订单。
+ * 每轮分别对各未完成订单（按订单号录入顺序；无订单号成品归为“无订单”组）
+ * 在固定纸型上试排一张，按以下顺序选定本张所属订单：
+ *   1. 本张已排成品面积大者优先；
+ *   2. 同分时本张已排件数多者优先；
+ *   3. 再同分按订单号录入顺序靠前者优先。
+ * 选中后仅扣减该订单的剩余需求，进入下一轮。订单一旦在某轮试排无进展
+ * （该固定纸型对其任一余件都放不下），即列入 blockedOrders 并立即停止：
+ * 不生成空白纸、不扣减任何订单的需求。
+ *
+ * @returns {{
+ *   paper: object, isolateOrders: true, stopReason: string,
+ *   summary: { maxSheets, sheetsUsed, piecesPlaced, piecesTotal, completionRate, cutsTotal },
+ *   sheets: Array<{ round, orderNo, piecesPlaced, placedArea, selection:{ranked}, layout }>,
+ *   remaining: Array, orders: Array, blockedOrders: Array
+ * }}
+ */
+function layoutBatchIsolated(input, maxSheets) {
+  const kerf = input.kerf;
+  // 探路：复用单张校验（非法成品/纹向/订单号直接抛错），并规范化首轮需求
+  const probe = layout({
+    paperW: input.paperW,
+    paperH: input.paperH,
+    paperGrain: input.paperGrain,
+    kerf,
+    products: input.products,
+  });
+  const totalPieces = probe.stats.piecesTotal;
+  const paper = probe.paper;
+
+  const initialDemand = (input.products || []).map((p, idx) => ({
+    id: p.id != null ? String(p.id) : `P${idx + 1}`,
+    name: p.name && String(p.name).trim() ? String(p.name).trim() : '',
+    orderNo: normalizeOrderNo(p.orderNo, idx + 1),
+    width: Number(p.width),
+    height: Number(p.height),
+    grain: normalizeProductGrain(p.grain, idx + 1),
+    quantity: Math.floor(Number(p.quantity)),
+  })).filter((p) => p.quantity > 0);
+
+  // 订单组（保持订单号首次录入顺序；无订单号 '' 为普通一组）
+  const groups = [];
+  const groupIndex = new Map();
+  initialDemand.forEach((p) => {
+    if (!groupIndex.has(p.orderNo)) {
+      groupIndex.set(p.orderNo, groups.length);
+      groups.push({ orderNo: p.orderNo, demand: [] });
+    }
+    groups[groupIndex.get(p.orderNo)].demand.push({ ...p });
+  });
+
+  // 空需求：直接完成，不用任何纸
+  if (totalPieces === 0) {
+    return {
+      paper,
+      isolateOrders: true,
+      stopReason: 'completed',
+      summary: {
+        maxSheets,
+        sheetsUsed: 0,
+        piecesPlaced: 0,
+        piecesTotal: 0,
+        completionRate: 1,
+        cutsTotal: 0,
+      },
+      sheets: [],
+      remaining: [],
+      orders: [],
+      blockedOrders: [],
+    };
+  }
+
+  // 每个订单的原始需求与已排件数（按成品 id 汇总，保留名称/规格/纹向）
+  const orderStats = groups.map((g, gi) => {
+    const byId = new Map();
+    for (const p of g.demand) {
+      byId.set(p.id, {
+        id: p.id, name: p.name, width: p.width, height: p.height,
+        grain: p.grain, total: p.quantity, placed: 0,
+      });
+    }
+    return { orderNo: g.orderNo, index: gi, byId };
+  });
+
+  const sheets = [];
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = 'max-sheets';
+  let blockedOrders = [];
+
+  for (let round = 0; round < maxSheets; round++) {
+    // 每轮分别试排各未完成订单
+    const candidates = [];
+    groups.forEach((g, gi) => {
+      if (g.demand.length === 0) return;
+      const result = layout({
+        paperW: input.paperW,
+        paperH: input.paperH,
+        paperGrain: input.paperGrain,
+        kerf,
+        products: g.demand,
+      });
+      const piecesPlaced = result.stats.piecesPlaced;
+      if (piecesPlaced === 0) {
+        blockedOrders = [{
+          orderNo: g.orderNo,
+          index: gi,
+          remaining: g.demand.reduce((s, d) => s + d.quantity, 0),
+          unplaced: result.unplaced,
+        }];
+        return;
+      }
+      candidates.push({
+        group: g,
+        orderIndex: gi,
+        orderNo: g.orderNo,
+        result,
+        piecesPlaced,
+        placedArea: round3(result.stats.placedArea),
+      });
+    });
+
+    if (blockedOrders.length > 0) {
+      // 任一剩余订单在该纸型上无进展：立即止损，不生成空白纸、不扣减需求
+      stopReason = 'no-progress';
+      break;
+    }
+    if (candidates.length === 0) {
+      // 所有订单均已完成
+      stopReason = 'completed';
+      break;
+    }
+
+    // 本张已排面积 → 件数 → 订单录入顺序
+    candidates.sort((a, b) => {
+      if (Math.abs(a.placedArea - b.placedArea) > EPS) {
+        return b.placedArea - a.placedArea;
+      }
+      if (b.piecesPlaced !== a.piecesPlaced) return b.piecesPlaced - a.piecesPlaced;
+      return a.orderIndex - b.orderIndex;
+    });
+    const best = candidates[0];
+
+    // 只扣减该订单的需求（其他订单需求原样保留）
+    best.group.demand = best.result.unplaced.map(demandRowFromUnplaced);
+    for (const it of best.result.items) {
+      const st = orderStats[best.orderIndex].byId.get(it.id);
+      if (st) st.placed += 1;
+    }
+    placedTotal += best.piecesPlaced;
+    cutsTotal += best.result.stats.cutsTotal;
+
+    sheets.push({
+      round: round + 1,
+      orderNo: best.orderNo,
+      piecesPlaced: best.piecesPlaced,
+      placedArea: best.placedArea,
+      selection: {
+        ranked: candidates.map((c) => ({
+          orderNo: c.orderNo,
+          piecesPlaced: c.piecesPlaced,
+          placedArea: c.placedArea,
+          selected: c === best,
+        })),
+      },
+      layout: best.result,
+    });
+
+    if (placedTotal >= totalPieces) {
+      stopReason = 'completed';
+      break;
+    }
+  }
+
+  const { remaining, orders } = summarizeByOrder(groups, orderStats);
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  // 受阻订单：把试排诊断到的 grainBlocked 回填到 remaining 明细
+  const blockedOut = blockedOrders.map((b) => {
+    if (stopReason === 'no-progress') {
+      for (const u of b.unplaced) {
+        const row = remaining.find((r) => r.orderNo === b.orderNo && r.id === u.id);
+        if (row) row.grainBlocked = !!u.grainBlocked;
+      }
+    }
+    const o = orders[b.index];
+    return {
+      orderNo: b.orderNo,
+      piecesTotal: o.piecesTotal,
+      piecesPlaced: o.piecesPlaced,
+      piecesRemaining: b.remaining,
+      completionRate: o.completionRate,
+      remaining: b.unplaced,
+    };
+  });
+
+  return {
+    paper,
+    isolateOrders: true,
+    stopReason,
+    summary: {
+      maxSheets,
+      sheetsUsed: sheets.length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000,
+      cutsTotal,
+    },
+    sheets,
+    remaining,
+    orders,
+    blockedOrders: blockedOut,
+  };
+}
+
+/**
+ * 汇总各订单的需求/已排/剩余/完成率，并产出逐成品 remaining 明细。
+ * @param {Array} groups     [{ orderNo, demand:[{id,name,width,height,grain,quantity}] }]
+ * @param {Array} orderStats [{ orderNo, index, byId:Map(id → {total,placed,...}) }]
+ */
+function summarizeByOrder(groups, orderStats) {
+  const remaining = [];
+  const orders = [];
+  orderStats.forEach((st) => {
+    const g = groups[st.index];
+    let piecesTotal = 0;
+    let piecesPlaced = 0;
+    for (const rec of st.byId.values()) {
+      piecesTotal += rec.total;
+      piecesPlaced += rec.placed;
+      const qty = rec.total - rec.placed;
+      if (qty > 0) {
+        remaining.push({
+          id: rec.id,
+          name: rec.name,
+          orderNo: st.orderNo,
+          width: rec.width,
+          height: rec.height,
+          grain: rec.grain,
+          grainBlocked: false,
+          total: rec.total,
+          placed: rec.placed,
+          quantity: qty,
+        });
+      }
+    }
+    orders.push({
+      orderNo: st.orderNo,
+      piecesTotal,
+      piecesPlaced,
+      piecesRemaining: piecesTotal - piecesPlaced,
+      completionRate: piecesTotal > 0
+        ? round3((piecesPlaced / piecesTotal) * 1000) / 1000
+        : 1,
+    });
+  });
+  return { remaining, orders };
+}
+
 module.exports = {
   layout,
   layoutBatch,
   grainAllows,
   normalizePaperGrain,
   normalizeProductGrain,
+  normalizeOrderNo,
+  normalizeIsolateOrders,
+  summarizeByOrder,
 };
