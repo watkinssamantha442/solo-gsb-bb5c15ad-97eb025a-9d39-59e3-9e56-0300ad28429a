@@ -45,11 +45,12 @@ function grainSelect(cls, options, value) {
   return `<select class="${cls}">${opts}</select>`;
 }
 
-function addProductRow(name = '', w = '', h = '', qty = '', grain = 'any') {
+function addProductRow(name = '', orderNo = '', w = '', h = '', qty = '', grain = 'any') {
   const row = document.createElement('div');
   row.className = 'products-row';
   row.innerHTML = `
     <input type="text" class="p-name" placeholder="如：名片 / 封面" value="${name}" />
+    <input type="text" class="p-order" placeholder="订单号（可选）" value="${orderNo}" maxlength="64" />
     <input type="number" class="p-w" min="0" step="0.1" placeholder="宽" value="${w}" />
     <input type="number" class="p-h" min="0" step="0.1" placeholder="高" value="${h}" />
     <input type="number" class="p-q" min="0" step="1" placeholder="数量" value="${qty}" />
@@ -93,11 +94,19 @@ function readProducts() {
       throw new Error(`第 ${i + 1} 行成品：宽高须为正数，数量须为非负整数。`);
     }
     if (quantity > 0) {
-      products.push({
+      const product = {
         name: row.querySelector('.p-name').value.trim(),
         width, height, quantity,
         grain: row.querySelector('.p-grain').value,
-      });
+      };
+      const orderNo = row.querySelector('.p-order').value.trim();
+      if (orderNo) {
+        if (orderNo.length > 64) {
+          throw new Error(`第 ${i + 1} 行成品：订单号长度不能超过 64 个字符。`);
+        }
+        product.orderNo = orderNo;
+      }
+      products.push(product);
     }
   });
   return products;
@@ -139,15 +148,20 @@ function readForm() {
   if (!(kerf >= 0)) throw new Error('刀缝宽度必须是非负数。');
 
   const mode = currentMode();
+  // 订单隔离仅对批量 / 多纸型排产生效
+  const isolateOrders = mode !== 'single' && $('isolateOrders').checked;
   if (mode === 'cost') {
-    return { kerf, papers: readPapers(), products: readProducts() };
+    return { kerf, papers: readPapers(), products: readProducts(), isolateOrders };
   }
 
   if (!(paperW > 0) || !(paperH > 0)) {
     throw new Error('纸张宽高必须为正数。');
   }
 
-  const payload = { paperW, paperH, paperGrain: $('paperGrain').value, kerf, products: readProducts() };
+  const payload = {
+    paperW, paperH, paperGrain: $('paperGrain').value, kerf,
+    products: readProducts(), isolateOrders,
+  };
 
   if (mode === 'batch') {
     const maxSheets = Number($('maxSheets').value);
@@ -302,6 +316,14 @@ function renderSvg(r) {
     text(cx, cy + lineH + 4, pieceText, {
       'text-anchor': 'middle', 'font-size': fs - 2, fill: '#868e96',
     });
+    // 隔离排产：逐件标明所属订单号（块面过小时省略以免溢出）
+    if (it.orderNo && Math.min(it.w, it.h) * scale >= 34) {
+      const orderLabel = it.orderNo.length > 12 ? `订单:${it.orderNo.slice(0, 11)}…` : `订单:${it.orderNo}`;
+      const orderEl = text(cx, cy + lineH * 2 + 3, orderLabel, {
+        'text-anchor': 'middle', 'font-size': fs - 2,
+      });
+      orderEl.setAttribute('class', 'order-tag');
+    }
   }
 
   // 图例
@@ -344,14 +366,22 @@ function renderCutList(r) {
 }
 
 function renderUnplaced(r, heading = '排不下的成品') {
+  // 隔离开启（或任意行带订单号）时增加订单列
+  const showOrder = r.unplaced.some((u) => u.orderNo);
   if (!r.unplaced.length) {
     $('unplaced').innerHTML = r.stats.piecesTotal
       ? '<p class="badge-ok">✔ 全部成品均已排入。</p>'
       : '<p>未提供成品。</p>';
     return;
   }
+  const orderCell = (u) => showOrder
+    ? `<td>${u.orderNo
+      ? `<b style="color:var(--brand)">${u.orderNo}</b>`
+      : '<span class="ord-null">未填写</span>'}</td>`
+    : '';
   const rows = r.unplaced.map((u) => `
     <tr>
+      ${orderCell(u)}
       <td>${u.name ? `${u.name}（${u.id}）` : u.id}</td>
       <td>${fmt(u.width)}×${fmt(u.height)}</td>
       <td>${grainReqLabel(u.grain)}</td>
@@ -362,7 +392,7 @@ function renderUnplaced(r, heading = '排不下的成品') {
   $('unplaced').innerHTML = `
     <h3>${heading}</h3>
     <table>
-      <thead><tr><th>名称</th><th>规格 宽×高 (mm)</th><th>纹向要求</th><th>已排/需求</th><th>剩余</th></tr></thead>
+      <thead><tr>${showOrder ? '<th>订单号</th>' : ''}<th>名称</th><th>规格 宽×高 (mm)</th><th>纹向要求</th><th>已排/需求</th><th>剩余</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
@@ -378,14 +408,63 @@ const STOP_REASONS = {
   'no-progress': (s) => ['warn', `⚠ 第 ${s.sheetsUsed + 1} 张纸排不进任何剩余成品，已立即停止（未生成空白纸），剩余 ${s.piecesTotal - s.piecesPlaced} 件。`],
 };
 
+/* ---------------- 订单隔离汇总（批量/成本共用） ---------------- */
+
+function orderLabel(o) {
+  return o.orderNo
+    ? `<b style="color:var(--brand)">${o.orderNo}</b>`
+    : '<span class="ord-null">未填写订单号（同组混排）</span>';
+}
+
+function renderOrderSummary(data) {
+  const box = $('orderSummary');
+  if (!data.isolated || !data.orderSummary || !data.orderSummary.length) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  const blockedKeys = new Set((data.blockedOrders || []).map((b) => b.orderNo));
+  const rows = data.orderSummary.map((o) => {
+    const blocked = blockedKeys.has(o.orderNo);
+    const pct = (o.completionRate * 100).toFixed(1);
+    return `
+      <tr class="${blocked ? 'blocked' : o.quantity === 0 ? 'done' : ''}">
+        <td>${orderLabel(o)}</td>
+        <td class="num">${o.total}</td>
+        <td class="num">${o.placed}</td>
+        <td class="num">${o.quantity}</td>
+        <td class="num">${pct}%</td>
+        <td>${blocked ? '<span class="blocked-badge">受阻（所有可用纸型均无进展）</span>' : o.quantity === 0 ? '✔ 已完成' : '进行中'}</td>
+      </tr>`;
+  }).join('');
+  box.innerHTML = `
+    <h3>订单汇总（每张纸仅排一个订单）</h3>
+    <table>
+      <thead><tr><th>订单号</th><th class="num">需求件数</th><th class="num">已排</th><th class="num">剩余</th><th class="num">完成率</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+  box.hidden = false;
+}
+
+function clearOrderSummary() {
+  const box = $('orderSummary');
+  box.hidden = true;
+  box.innerHTML = '';
+}
+
 function renderBatch(data) {
   batchState = data;
   const s = data.summary;
   const pct = (s.completionRate * 100).toFixed(1);
   const [cls, text] = (STOP_REASONS[data.stopReason] || (() => ['warn', data.stopReason]))(s);
 
+  const blockedNote = data.isolated && data.blockedOrders && data.blockedOrders.length
+    ? ` 受阻订单：${data.blockedOrders.map((b) => b.orderNo || '未填写订单号组').join('、')}（未生成空白纸、未误扣库存）。`
+    : '';
+
   $('batchBar').innerHTML = `
-    <div class="stop-reason ${cls}">${text}</div>
+    <div class="stop-reason ${cls}">${text}${blockedNote}</div>
     <div class="stats">
       <div class="stat">用纸数：<b>${s.sheetsUsed}</b> / 上限 ${s.maxSheets} 张</div>
       <div class="stat">已排/总数：<b>${s.piecesPlaced}/${s.piecesTotal}</b> 件</div>
@@ -397,7 +476,11 @@ function renderBatch(data) {
   `;
   $('batchBar').hidden = false;
 
-  renderSheetTabs(data.sheets, (sh, i) => `第 ${i + 1} 张（${sh.stats.piecesPlaced} 件）`);
+  renderOrderSummary(data);
+
+  renderSheetTabs(data.sheets, (sh, i) => data.isolated && sh.orderNo
+    ? `第 ${i + 1} 张 · ${sh.orderNo}（${sh.stats.piecesPlaced} 件）`
+    : `第 ${i + 1} 张（${sh.stats.piecesPlaced} 件）`);
 
   if (data.sheets.length) {
     showBatchSheet(0);
@@ -427,6 +510,7 @@ function clearBatchUi() {
   batchState = null;
   $('batchBar').hidden = true;
   $('batchBar').innerHTML = '';
+  clearOrderSummary();
 }
 
 /* ---------------- 多纸型成本排产 ---------------- */
@@ -449,6 +533,10 @@ function renderCost(data) {
   const pct = (s.completionRate * 100).toFixed(1);
   const [cls, text] = (COST_STOP_REASONS[data.stopReason] || (() => ['warn', data.stopReason]))(s);
 
+  const blockedNote = data.isolated && data.blockedOrders && data.blockedOrders.length
+    ? ` 受阻订单：${data.blockedOrders.map((b) => b.orderNo || '未填写订单号组').join('、')}（未生成空白纸、不扣任何库存）。`
+    : '';
+
   const usedKinds = data.usage.filter((u) => u.used > 0);
   const mixedTags = usedKinds.map((u) => `
     <span class="mixed-tag">
@@ -457,7 +545,7 @@ function renderCost(data) {
     </span>`).join('');
 
   $('costBar').innerHTML = `
-    <div class="stop-reason ${cls}">${text}
+    <div class="stop-reason ${cls}">${text}${blockedNote}
       终止原因：<code>${data.stopReason}</code></div>
     <div class="stats">
       <div class="stat">用纸数：<b>${s.sheetsUsed}</b> 张（${s.paperKindsUsed} 种纸）</div>
@@ -504,8 +592,11 @@ function renderCost(data) {
   `;
   $('costUsage').hidden = false;
 
-  renderSheetTabs(data.sheets, (sh, i) =>
-    `第 ${i + 1} 张 · ${sh.paperName}（${sh.piecesPlaced} 件）`);
+  renderOrderSummary(data);
+
+  renderSheetTabs(data.sheets, (sh) => data.isolated && sh.orderNo
+    ? `第 ${sh.round} 张 · ${sh.orderNo} · ${sh.paperName}（${sh.piecesPlaced} 件）`
+    : `第 ${sh.round} 张 · ${sh.paperName}（${sh.piecesPlaced} 件）`);
 
   if (data.sheets.length) {
     showCostSheet(0);
@@ -528,9 +619,13 @@ function showCostSheet(i) {
   if (!costState || !costState.sheets[i]) return;
   setActiveTab(i);
   const sh = costState.sheets[i];
+  const orderMeta = sh.orderNo
+    ? `<span>订单：<b style="color:var(--brand)">${sh.orderNo}</b>（本张仅此订单）</span>`
+    : '';
   $('sheetMeta').hidden = false;
   $('sheetMeta').innerHTML = `
     <span>第 <b>${sh.round}</b> 轮用纸</span>
+    ${orderMeta}
     <span>纸型：<span class="paper-cell"><span class="dot" style="background:${colorFor(sh.paperId)}"></span><b>${sh.paperName}</b>（${sh.paperId}）</span></span>
     <span>纸面：<b>${fmt(sh.paperWidth)}×${fmt(sh.paperHeight)}</b> mm</span>
     <span>纹向：<b>${paperGrainLabel(sh.paperGrain)}</b></span>
@@ -546,18 +641,23 @@ function showCostSheet(i) {
 
 function renderRank(sh) {
   const ranked = [...sh.selection.ranked].sort((a, b) => a.costPerM2 - b.costPerM2);
+  const showOrder = ranked.some((c) => c.orderNo);
+  const orderHead = showOrder ? '<th>订单号</th>' : '';
   $('rankList').hidden = false;
   $('rankList').innerHTML = `
-    <h3>本轮候选纸型选择指标（按单位面积成本排序）</h3>
+    <h3>本轮候选${showOrder ? '「订单 × 纸型」' : '纸型'}选择指标（按单位面积成本排序）</h3>
     <table class="rank-table">
       <thead><tr>
-        <th>排名</th><th>纸型</th><th class="num">已排件数</th>
+        <th>排名</th>${orderHead}<th>纸型</th><th class="num">已排件数</th>
         <th class="num">已排面积 (mm²)</th><th class="num">单位成本（元/m²）</th><th>结果</th>
       </tr></thead>
       <tbody>
         ${ranked.map((c, i) => `
           <tr class="${c.selected ? 'winner' : ''}">
             <td>${i + 1}</td>
+            ${showOrder ? `<td>${c.orderNo
+              ? `<b style="color:var(--brand)">${c.orderNo}</b>`
+              : '<span class="ord-null">未填写</span>'}</td>` : ''}
             <td><span class="paper-cell"><span class="dot" style="background:${colorFor(c.paperId)}"></span>${c.paperName}（${c.paperId}）</span></td>
             <td class="num">${c.piecesPlaced}</td>
             <td class="num">${fmt(c.placedArea)}</td>
@@ -581,6 +681,7 @@ function clearCostUi() {
   $('sheetMeta').innerHTML = '';
   $('rankList').hidden = true;
   $('rankList').innerHTML = '';
+  clearOrderSummary();
 }
 
 /* ---------------- 逐张标签（批量/成本共用） ---------------- */
@@ -643,6 +744,7 @@ async function generate() {
     } else {
       clearBatchUi();
       clearCostUi();
+      clearOrderSummary();
       renderStats(data);
       renderSvg(data);
       renderCutList(data);
@@ -670,6 +772,8 @@ document.querySelectorAll('input[name="mode"]').forEach((r) =>
     const cost = mode === 'cost';
     $('batchOpts').hidden = !batch;
     $('costOpts').hidden = !cost;
+    // 订单隔离仅对批量 / 多纸型排产有意义
+    $('isolateOpts').hidden = mode === 'single';
     // 成本模式下纸张宽高、纹向与常用纸度不适用（候选在纸型表格中录入）
     $('paperWLabel').hidden = cost;
     $('paperHLabel').hidden = cost;
@@ -690,8 +794,8 @@ $('clearBtn').addEventListener('click', () => {
 $('generate').addEventListener('click', generate);
 
 // 初始示例：大度全张 889×1194，刀缝 3mm
-addProductRow('封面', 210, 285, 12);
-addProductRow('名片', 90, 54, 80);
+addProductRow('封面', '', 210, 285, 12);
+addProductRow('名片', '', 90, 54, 80);
 addProductRow();
 
 // 多纸型成本排产初始候选：大度全张 + A3

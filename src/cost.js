@@ -17,9 +17,22 @@
  * 因尺寸或纹向限制排不进任何余件的纸型不参与当轮选择（即可行候选排名
  * 已排除纹向不可行的纸型）；空白纸（排不进任何余件）绝不计入结果：
  * 不扣库存、不入选。
+ *
+ * 订单隔离（input.isolateOrders === true 且至少一行填写订单号时）：
+ * 每张纸仅排一个订单——每轮联合比较“订单 × 纸型”候选（对各未完成订单、
+ * 各有库存纸型分别试排），仍以单位已排面积成本 ↓、本张已排件数 ↓、
+ * 订单录入顺序 ↑、纸型录入顺序 ↑ 决胜；选中后只扣减该订单需求与该纸型库存。
+ * 若任一剩余订单在所有可用纸型上均无进展，返回 no-progress 与
+ * blockedOrders：本轮不提交任何纸张、不扣任何库存、不生成空白纸。
  */
 
-const { layout, normalizePaperGrain, normalizeProductGrain } = require('./packer');
+const {
+  layout,
+  normalizePaperGrain,
+  normalizeIsolateOrders,
+  normalizeProducts,
+  buildOrderGroups,
+} = require('./packer');
 
 const MM2_PER_M2 = 1_000_000;
 const MAX_SHEETS = 500;
@@ -28,9 +41,11 @@ const round3 = (v) => Math.round(v * 1000) / 1000;
 const round4 = (v) => Math.round(v * 10000) / 10000;
 const round2 = (v) => Math.round(v * 100) / 100;
 
+const sumDemand = (rows) => (rows || []).reduce((s, r) => s + r.quantity, 0);
+
 /**
  * 校验并规范化候选纸型列表。
- * @returns 规范化后的纸型：{ id, name, width, height, grain, price, stock }
+ * @returns 规范化后的纸型：{ id, name, width, height, grain, price, stock, seq }
  */
 function normalizePapers(rawPapers) {
   if (!Array.isArray(rawPapers)) throw new Error('缺少候选纸张列表（papers）');
@@ -70,8 +85,22 @@ function normalizePapers(rawPapers) {
       grain,
       price,
       stock,
+      seq: idx,
     };
   });
+}
+
+/** 以某张布局的 unplaced 构造下一轮需求（纹向/订单号随件保留） */
+function demandFromUnplaced(unplaced) {
+  return unplaced.map((u) => ({
+    id: u.id,
+    name: u.name,
+    width: u.width,
+    height: u.height,
+    grain: u.grain,
+    orderNo: u.orderNo,
+    quantity: u.quantity,
+  }));
 }
 
 /**
@@ -80,9 +109,10 @@ function normalizePapers(rawPapers) {
  *   kerf: number(mm)
  *   papers: [{ name?, width, height, grain?, price, stock }]（2～8 种，
  *     grain 为 'along-width' | 'along-height'，缺省沿宽）
- *   products: [{ id?, name?, width, height, quantity,
- *     grain?: 'any' | 'along-width' | 'along-height' }]（纹向要求，缺省不限）
- * @returns 逐张纸型、布局、选择指标、各纸型用量、总成本、剩余件数与终止原因
+ *   products: [{ id?, name?, width, height, quantity, grain?, orderNo? }]
+ *   isolateOrders?: boolean（每张纸仅排一个订单，缺省 false）
+ * @returns 逐张纸型、布局、选择指标、各纸型用量、总成本、剩余件数与终止原因；
+ *   隔离开启时另含 isolated、orderSummary、blockedOrders，逐张含 orderNo
  */
 function layoutCostBatch(input) {
   const kerf = Number(input.kerf);
@@ -90,24 +120,23 @@ function layoutCostBatch(input) {
     throw new Error('刀缝宽度必须是非负数字');
   }
   const papers = normalizePapers(input.papers);
-  if (!Array.isArray(input.products)) throw new Error('缺少成品列表');
+  const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
+  const products = normalizeProducts(input.products);
+  const totalPieces = products.reduce((s, p) => s + p.quantity, 0);
 
-  // 先做一次探路排样：复用单张校验（非法成品/纹向直接抛错），并取得总需求
-  const probe = layout({
-    paperW: papers[0].width,
-    paperH: papers[0].height,
-    paperGrain: papers[0].grain,
-    kerf,
-    products: input.products,
-  });
-  const totalPieces = probe.stats.piecesTotal;
-  const originalTotal = new Map(); // id → 原始需求件数
-  input.products.forEach((p, idx) => {
-    const q = Math.floor(Number(p.quantity));
-    if (!(q > 0)) return;
-    const id = p.id != null ? String(p.id) : `P${idx + 1}`;
-    originalTotal.set(id, (originalTotal.get(id) || 0) + q);
-  });
+  const usageEmpty = papers.map((p) => ({
+    id: p.id,
+    name: p.name,
+    width: p.width,
+    height: p.height,
+    grain: p.grain,
+    price: p.price,
+    stock: p.stock,
+    used: 0,
+    remainingStock: p.stock,
+    cost: 0,
+    placedArea: 0,
+  }));
 
   // 空需求：直接完成，不用任何纸
   if (totalPieces === 0) {
@@ -129,40 +158,118 @@ function layoutCostBatch(input) {
         effectiveCostPerM2: null,
       },
       sheets: [],
-      usage: papers.map((p) => ({
-        id: p.id,
-        name: p.name,
-        width: p.width,
-        height: p.height,
-        grain: p.grain,
-        price: p.price,
-        stock: p.stock,
-        used: 0,
-        remainingStock: p.stock,
-        cost: 0,
-        placedArea: 0,
-      })),
+      usage: usageEmpty,
       remaining: [],
+      ...(isolateOrders
+        ? { isolated: true, orderSummary: [], blockedOrders: [] }
+        : {}),
     };
   }
 
-  const stock = new Map(papers.map((p) => [p.id, p.stock]));
+  const run = isolateOrders
+    ? runIsolated(kerf, papers, products, totalPieces)
+    : runPlain(kerf, papers, products, totalPieces);
+
+  return assembleResult(kerf, papers, isolateOrders, run);
+}
+
+/**
+ * 汇总两种模式的公共结果。
+ * @param {object} run
+ *   stopReason, sheets, remaining, placedTotal, cutsTotal
+ */
+function assembleResult(kerf, papers, isolateOrders, run) {
+  const { stopReason, sheets, remaining, placedTotal, cutsTotal, orderExtras } = run;
+
   const usedCount = new Map(papers.map((p) => [p.id, 0]));
   const costSum = new Map(papers.map((p) => [p.id, 0]));
   const placedAreaSum = new Map(papers.map((p) => [p.id, 0]));
+  for (const sh of sheets) {
+    usedCount.set(sh.paperId, usedCount.get(sh.paperId) + 1);
+    costSum.set(sh.paperId, costSum.get(sh.paperId) + sh.price);
+    placedAreaSum.set(sh.paperId, placedAreaSum.get(sh.paperId) + sh.placedArea);
+  }
 
-  // 规范化首轮需求（后续轮次由上一张的 unplaced 映射而来，纹向随件保留）
-  const initialDemand = input.products.map((p, idx) => ({
-    id: p.id != null ? String(p.id) : `P${idx + 1}`,
-    name: p.name && String(p.name).trim() ? String(p.name).trim() : '',
-    width: Number(p.width),
-    height: Number(p.height),
-    grain: normalizeProductGrain(p.grain, idx + 1),
-    quantity: Math.floor(Number(p.quantity)),
-  })).filter((p) => p.quantity > 0);
-  let demand = initialDemand;
+  const totalPieces = run.totalPieces;
+  const usage = papers.map((p) => {
+    const used = usedCount.get(p.id);
+    const cost = round2(costSum.get(p.id));
+    return {
+      id: p.id,
+      name: p.name,
+      width: p.width,
+      height: p.height,
+      grain: p.grain,
+      price: p.price,
+      stock: p.stock,
+      used,
+      remainingStock: p.stock - used,
+      cost,
+      placedArea: round3(placedAreaSum.get(p.id)),
+    };
+  });
+
+  const totalCost = round2(sheets.reduce((s, sh) => s + sh.price, 0));
+  const totalPlacedArea = round3(
+    sheets.reduce((s, sh) => s + sh.placedArea, 0)
+  );
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  return {
+    kerf: round3(kerf),
+    papers: papers.map((p) => ({ ...p })),
+    stopReason,
+    summary: {
+      rounds: sheets.length,
+      sheetsUsed: sheets.length,
+      paperKindsUsed: papers.filter((p) => usedCount.get(p.id) > 0).length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000,
+      cutsTotal,
+      totalCost,
+      totalPlacedArea,
+      totalPlacedAreaM2: round4(totalPlacedArea / MM2_PER_M2),
+      effectiveCostPerM2: totalPlacedArea > 0
+        ? round4((totalCost / totalPlacedArea) * MM2_PER_M2)
+        : null,
+    },
+    sheets,
+    usage,
+    remaining,
+    ...(isolateOrders
+      ? {
+          isolated: true,
+          orderSummary: orderExtras.orderSummary,
+          blockedOrders: orderExtras.blockedOrders,
+        }
+      : {}),
+  };
+}
+
+/* ---------------- 非隔离（原有行为） ---------------- */
+
+function runPlain(kerf, papers, products, totalPieces) {
+  // id → 原始需求件数
+  const originalTotal = new Map();
+  for (const p of products) {
+    originalTotal.set(p.id, (originalTotal.get(p.id) || 0) + p.quantity);
+  }
+
+  const stock = new Map(papers.map((p) => [p.id, p.stock]));
+
+  let demand = products.map((p) => ({ ...p }));
   const sheets = [];
-  let lastUnplaced = initialDemand;
+  // 首轮即库存耗尽/异常止损时据此回填全部剩余需求
+  let lastUnplaced = products.map((p) => ({
+    id: p.id,
+    name: p.name,
+    width: p.width,
+    height: p.height,
+    grain: p.grain,
+    orderNo: p.orderNo,
+    quantity: p.quantity,
+  }));
   let placedTotal = 0;
   let cutsTotal = 0;
   let stopReason = null;
@@ -223,6 +330,7 @@ function layoutCostBatch(input) {
         width: d.width,
         height: d.height,
         grain: d.grain,
+        orderNo: d.orderNo,
         grainBlocked: grainBlockedById.get(d.id) || false,
         quantity: d.quantity,
       }));
@@ -238,16 +346,13 @@ function layoutCostBatch(input) {
         return da;
       }
       if (b.piecesPlaced !== a.piecesPlaced) return b.piecesPlaced - a.piecesPlaced;
-      return papers.indexOf(a.paper) - papers.indexOf(b.paper);
+      return a.paper.seq - b.paper.seq;
     });
     const best = candidates[0];
 
     // 提交本张：扣库存、扣需求
     const p = best.paper;
     stock.set(p.id, stock.get(p.id) - 1);
-    usedCount.set(p.id, usedCount.get(p.id) + 1);
-    costSum.set(p.id, costSum.get(p.id) + p.price);
-    placedAreaSum.set(p.id, placedAreaSum.get(p.id) + best.placedArea);
     placedTotal += best.piecesPlaced;
     cutsTotal += best.result.stats.cutsTotal;
     lastUnplaced = best.result.unplaced;
@@ -282,14 +387,7 @@ function layoutCostBatch(input) {
       break;
     }
 
-    demand = best.result.unplaced.map((u) => ({
-      id: u.id,
-      name: u.name,
-      width: u.width,
-      height: u.height,
-      grain: u.grain,
-      quantity: u.quantity,
-    }));
+    demand = demandFromUnplaced(best.result.unplaced);
   }
 
   if (stopReason === null) {
@@ -305,6 +403,7 @@ function layoutCostBatch(input) {
       width: u.width,
       height: u.height,
       grain: u.grain,
+      orderNo: u.orderNo,
       grainBlocked: !!u.grainBlocked,
       total,
       placed: total - u.quantity,
@@ -312,52 +411,216 @@ function layoutCostBatch(input) {
     };
   });
 
-  const usage = papers.map((p) => {
-    const used = usedCount.get(p.id);
-    const cost = round2(costSum.get(p.id));
-    return {
-      id: p.id,
-      name: p.name,
-      width: p.width,
-      height: p.height,
-      grain: p.grain,
+  return { stopReason, sheets, remaining, placedTotal, cutsTotal, totalPieces };
+}
+
+/* ---------------- 订单隔离 ---------------- */
+
+/**
+ * 隔离成本排产：每轮联合比较“订单 × 纸型”候选。
+ * 决胜顺序：单位已排面积成本 ↓ → 本张已排件数 ↓ → 订单录入顺序 ↑
+ *           → 纸型录入顺序 ↑。
+ * 任一剩余订单在所有有库存纸型上均排不进时立即止损（不扣库存）。
+ */
+function runIsolated(kerf, papers, products, totalPieces) {
+  const groups = buildOrderGroups(products);
+  const orderTotals = new Map(groups.map((g) => [g.key, sumDemand(g.rows)]));
+  // 各订单内 id → 原始需求件数
+  const idTotalsByGroup = new Map(groups.map((g) => {
+    const m = new Map();
+    for (const p of g.rows) m.set(p.id, (m.get(p.id) || 0) + p.quantity);
+    return [g.key, m];
+  }));
+  const demandByKey = new Map(
+    groups.map((g) => [g.key, g.rows.map((p) => ({ ...p }))])
+  );
+
+  const stock = new Map(papers.map((p) => [p.id, p.stock]));
+
+  const sheets = [];
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = null;
+  let blockedGroups = [];
+  let grainBlockedById = null;
+  const roundLimit = papers.reduce((s, p) => s + p.stock, 0);
+
+  for (let round = 0; round < roundLimit; round++) {
+    const active = groups.filter((g) => sumDemand(demandByKey.get(g.key)) > 0);
+    if (active.length === 0) {
+      stopReason = 'completed';
+      break;
+    }
+    if (papers.every((p) => stock.get(p.id) <= 0)) {
+      stopReason = 'stock-exhausted';
+      break;
+    }
+
+    // 联合试排：每个“未完成订单 × 有库存纸型”各排一张
+    const candidates = [];
+    const blockedByGroup = new Map(); // group.key → 该订单在各纸型的受阻试排
+    for (const g of active) {
+      const blockedTrials = [];
+      for (const p of papers) {
+        if (stock.get(p.id) <= 0) continue;
+        const result = layout({
+          paperW: p.width,
+          paperH: p.height,
+          paperGrain: p.grain,
+          kerf,
+          products: demandByKey.get(g.key),
+        });
+        if (result.stats.piecesPlaced === 0) {
+          blockedTrials.push({ paper: p, result });
+          continue;
+        }
+        const placedArea = round3(result.stats.placedArea);
+        const rawCostPerM2 = (p.price / placedArea) * MM2_PER_M2;
+        candidates.push({
+          group: g,
+          paper: p,
+          result,
+          piecesPlaced: result.stats.piecesPlaced,
+          placedArea,
+          rawCostPerM2,
+          costPerM2: round4(rawCostPerM2),
+        });
+      }
+      blockedByGroup.set(g.key, blockedTrials);
+    }
+
+    // 任一剩余订单在所有可用纸型上均无进展 → 立即止损：
+    // 本轮不提交任何纸张、不扣任何库存、不生成空白纸
+    const blocked = active.filter((g) => blockedByGroup.get(g.key).length > 0
+      && !candidates.some((c) => c.group === g));
+    if (blocked.length > 0) {
+      stopReason = 'no-progress';
+      blockedGroups = blocked;
+      grainBlockedById = new Map();
+      for (const g of blocked) {
+        // 以该订单任一可用纸型的试排结果回填剩余与受阻诊断
+        const trial = blockedByGroup.get(g.key)[0];
+        demandByKey.set(g.key, demandFromUnplaced(trial.result.unplaced));
+        for (const t of blockedByGroup.get(g.key)) {
+          for (const u of t.result.unplaced) {
+            if (u.grainBlocked) grainBlockedById.set(u.id, true);
+          }
+        }
+      }
+      break;
+    }
+
+    // 单位已排面积成本 ↓ → 件数 ↓ → 订单录入顺序 ↑ → 纸型录入顺序 ↑
+    candidates.sort((a, b) => {
+      const da = a.rawCostPerM2 - b.rawCostPerM2;
+      if (Math.abs(da) > 1e-9 * Math.max(1, Math.abs(a.rawCostPerM2), Math.abs(b.rawCostPerM2))) {
+        return da;
+      }
+      if (b.piecesPlaced !== a.piecesPlaced) return b.piecesPlaced - a.piecesPlaced;
+      if (a.group.seq !== b.group.seq) return a.group.seq - b.group.seq;
+      return a.paper.seq - b.paper.seq;
+    });
+    const best = candidates[0];
+
+    // 提交：只扣该纸型库存与该订单需求
+    const p = best.paper;
+    const g = best.group;
+    stock.set(p.id, stock.get(p.id) - 1);
+    placedTotal += best.piecesPlaced;
+    cutsTotal += best.result.stats.cutsTotal;
+    demandByKey.set(g.key, demandFromUnplaced(best.result.unplaced));
+
+    sheets.push({
+      round: round + 1,
+      orderNo: g.orderNo,
+      paperId: p.id,
+      paperName: p.name,
+      paperWidth: p.width,
+      paperHeight: p.height,
+      paperGrain: p.grain,
       price: p.price,
-      stock: p.stock,
-      used,
-      remainingStock: p.stock - used,
-      cost,
-      placedArea: round3(placedAreaSum.get(p.id)),
+      piecesPlaced: best.piecesPlaced,
+      placedArea: best.placedArea,
+      costPerM2: best.costPerM2,
+      selection: {
+        ranked: candidates.map((c) => ({
+          orderNo: c.group.orderNo,
+          paperId: c.paper.id,
+          paperName: c.paper.name,
+          feasible: true,
+          piecesPlaced: c.piecesPlaced,
+          placedArea: c.placedArea,
+          costPerM2: c.costPerM2,
+          selected: c === best,
+        })),
+      },
+      layout: Object.assign(best.result, { orderNo: g.orderNo }),
+    });
+
+    if (placedTotal >= totalPieces) {
+      stopReason = 'completed';
+      break;
+    }
+  }
+
+  if (stopReason === null) stopReason = 'stock-exhausted';
+
+  // 摊平剩余（按订单录入顺序、订单内录入顺序）
+  const remaining = [];
+  for (const g of groups) {
+    const idm = idTotalsByGroup.get(g.key);
+    for (const r of demandByKey.get(g.key) || []) {
+      if (r.quantity <= 0) continue;
+      const total = idm.has(r.id) ? idm.get(r.id) : r.quantity;
+      remaining.push({
+        id: r.id,
+        name: r.name,
+        width: r.width,
+        height: r.height,
+        grain: r.grain,
+        orderNo: r.orderNo,
+        grainBlocked: !!(grainBlockedById && grainBlockedById.get(r.id)),
+        total,
+        placed: total - r.quantity,
+        quantity: r.quantity,
+      });
+    }
+  }
+
+  const remainingByKey = new Map();
+  for (const g of groups) {
+    remainingByKey.set(
+      g.key,
+      remaining.filter((r) => (r.orderNo === null ? '\0' : r.orderNo) === g.key)
+    );
+  }
+  const orderSummary = groups.map((g) => {
+    const total = orderTotals.get(g.key) || 0;
+    const quantity = sumDemand(remainingByKey.get(g.key));
+    const placed = total - quantity;
+    return {
+      orderNo: g.orderNo,
+      seq: g.seq,
+      total,
+      placed,
+      quantity,
+      completionRate: total > 0 ? round3((placed / total) * 1000) / 1000 : 1,
     };
   });
-
-  const totalCost = round2(sheets.reduce((s, sh) => s + sh.price, 0));
-  const totalPlacedArea = round3(
-    sheets.reduce((s, sh) => s + sh.placedArea, 0)
-  );
-  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+  const blockedOrders = blockedGroups.map((g) => ({
+    orderNo: g.orderNo,
+    total: orderTotals.get(g.key) || 0,
+    quantity: sumDemand(demandByKey.get(g.key)),
+  }));
 
   return {
-    kerf: round3(kerf),
-    papers: papers.map((p) => ({ ...p })),
     stopReason,
-    summary: {
-      rounds: sheets.length,
-      sheetsUsed: sheets.length,
-      paperKindsUsed: papers.filter((p) => usedCount.get(p.id) > 0).length,
-      piecesPlaced: placedTotal,
-      piecesTotal: totalPieces,
-      completionRate: round3(completionRate * 1000) / 1000,
-      cutsTotal,
-      totalCost,
-      totalPlacedArea,
-      totalPlacedAreaM2: round4(totalPlacedArea / MM2_PER_M2),
-      effectiveCostPerM2: totalPlacedArea > 0
-        ? round4((totalCost / totalPlacedArea) * MM2_PER_M2)
-        : null,
-    },
     sheets,
-    usage,
     remaining,
+    placedTotal,
+    cutsTotal,
+    totalPieces,
+    orderExtras: { orderSummary, blockedOrders },
   };
 }
 

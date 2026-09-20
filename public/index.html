@@ -49,6 +49,16 @@
         <label><input type="radio" name="mode" value="batch" /> 批量排产</label>
         <label><input type="radio" name="mode" value="cost" /> 多纸型成本排产</label>
       </div>
+      <div id="isolateOpts" class="isolate-opts" hidden>
+        <label class="check-line">
+          <input type="checkbox" id="isolateOrders" />
+          <span><b>每张纸仅排一个订单</b>（订单隔离排产）</span>
+        </label>
+        <p class="hint">开启后，批量每轮分别试排各未完成订单，按本张已排面积、件数、录入顺序选订单；
+          多纸型每轮联合比较「订单 × 纸型」候选，仍按单位已排面积成本、件数、录入顺序决胜，
+          选中后只扣减该订单与该纸型库存。任一剩余订单在所有可用纸型均无进展时返回受阻订单，不生成空白纸、不误扣库存。
+          未填写订单号的行视为同组且不影响其他订单。</p>
+      </div>
       <div id="batchOpts" class="batch-opts" hidden>
         <label>最多用纸张数（张）
           <input type="number" id="maxSheets" value="10" min="1" max="500" step="1" />
@@ -67,9 +77,10 @@
       </div>
 
       <h2>成品清单</h2>
-      <p class="hint products-hint">纹向要求：成品纹向须与纸张纹向平行——「沿自身宽/高」指纸张纹向需平行于成品的宽/高边；不限则两种朝向均可。</p>
+      <p class="hint products-hint">纹向要求：成品纹向须与纸张纹向平行——「沿自身宽/高」指纸张纹向需平行于成品的宽/高边；不限则两种朝向均可。
+        订单号可选：填写后可在批量/多纸型模式开启「每张纸仅排一个订单」做订单隔离排产。</p>
       <div class="products-head">
-        <span>名称（可选）</span><span>宽 mm</span><span>高 mm</span><span>数量</span><span>纹向</span><span></span>
+        <span>名称（可选）</span><span>订单号（可选）</span><span>宽 mm</span><span>高 mm</span><span>数量</span><span>纹向</span><span></span>
       </div>
       <div id="productRows"></div>
       <button type="button" id="addRow" class="btn btn-ghost">＋ 添加成品</button>
@@ -85,6 +96,7 @@
       <h2>排料结果</h2>
       <div id="batchBar" class="batch-bar" hidden></div>
       <div id="costBar" class="batch-bar" hidden></div>
+      <div id="orderSummary" class="order-summary" hidden></div>
       <div id="sheetTabs" class="sheet-tabs" hidden></div>
       <div id="sheetMeta" class="sheet-meta" hidden></div>
       <div id="costUsage" class="cost-usage" hidden></div>
